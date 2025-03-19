@@ -147,6 +147,8 @@
             %}>Student Details</a>
         <a href="{{ url_for('unpaid_students') }}" {% if request.endpoint=='unpaid_students' %}class="active" {% endif
             %}>Download</a>
+        <a href="{{ url_for('delete_paid_students') }}" {% if request.endpoint=='delete_paid_students' %}class="active"
+            {% endif %}>Delete Paid</a>
     </div>
     <!-- Add logout button -->
     <div class="navbar-right">
