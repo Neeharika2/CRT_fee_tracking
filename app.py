@@ -65,6 +65,104 @@ def get_standardized_fee_type_label(fee_type):
         return fee_type.title()  # Default case, capitalize words
 
 # Function to create visualizations
+
+def get_payment_status_by_fee_type():
+    fee_type_stats = {}
+    
+    try:
+        # Get all distinct batch years
+        batch_years = [year[0] for year in db.session.query(Student.batch_year).distinct().order_by(Student.batch_year).all()]
+        
+        # Initialize the stats dictionary with batch year breakdowns
+        for fee_type in ['CRT', 'Phase 2', 'Phase 3']:
+            fee_type_stats[fee_type] = {
+                'total': 0, 
+                'paid': 0, 
+                'partially_paid': 0, 
+                'not_paid': 0,
+                'by_batch': {year: {'total': 0, 'paid': 0, 'partially_paid': 0, 'not_paid': 0} for year in batch_years}
+            }
+        
+        # Get all students with fee entries
+        students = db.session.query(Student.regd_no, Student.batch_year).join(
+            FeeMaster, FeeMaster.regd_no == Student.regd_no
+        ).distinct().all()
+        
+        # Log how many students we're processing
+        app.logger.info(f"Processing payment status for {len(students)} students across all batches")
+        
+        # Process each student
+        for student in students:
+            regd_no = student.regd_no
+            batch_year = student.batch_year
+            
+            # Get all fee entries for this student
+            fee_entries = db.session.query(
+                FeeMaster.fee_type,
+                FeeMaster.amount,
+                FeeMaster.remarks
+            ).filter(FeeMaster.regd_no == regd_no).all()
+            
+            # Process each fee entry
+            for entry in fee_entries:
+                std_fee_type = get_standardized_fee_type_label(entry.fee_type)
+                
+                # Skip if not one of our standard fee types
+                if std_fee_type not in fee_type_stats:
+                    continue
+                
+                # Get payment info for this fee type
+                normalized_entry_type = normalize_fee_type(entry.fee_type)
+                payment = db.session.query(
+                    db.func.sum(Payment.amount_paid).label('total_paid')
+                ).filter(
+                    Payment.regd_no == regd_no,
+                    db.func.lower(Payment.fee_type).like(f'%{normalized_entry_type}%')
+                ).first()
+                
+                # Calculate payment status using same logic as student details
+                total_paid = payment.total_paid if payment and payment.total_paid else 0
+                entry_amount = float(entry.amount)
+                
+                # Increment total counter
+                fee_type_stats[std_fee_type]['total'] += 1
+                if batch_year in fee_type_stats[std_fee_type]['by_batch']:
+                    fee_type_stats[std_fee_type]['by_batch'][batch_year]['total'] += 1
+                
+                # Determine status with same epsilon logic as student details
+                epsilon = 0.01  # Allow for small floating point differences
+                if total_paid >= (entry_amount - epsilon):
+                    fee_type_stats[std_fee_type]['paid'] += 1
+                    if batch_year in fee_type_stats[std_fee_type]['by_batch']:
+                        fee_type_stats[std_fee_type]['by_batch'][batch_year]['paid'] += 1
+                elif total_paid > 0:
+                    fee_type_stats[std_fee_type]['partially_paid'] += 1
+                    if batch_year in fee_type_stats[std_fee_type]['by_batch']:
+                        fee_type_stats[std_fee_type]['by_batch'][batch_year]['partially_paid'] += 1
+                else:
+                    fee_type_stats[std_fee_type]['not_paid'] += 1
+                    if batch_year in fee_type_stats[std_fee_type]['by_batch']:
+                        fee_type_stats[std_fee_type]['by_batch'][batch_year]['not_paid'] += 1
+        
+        # Log the stats before returning
+        for fee_type, stats in fee_type_stats.items():
+            app.logger.info(f"{fee_type} stats: Total={stats['total']}, Paid={stats['paid']}, "
+                           f"Partially Paid={stats['partially_paid']}, Not Paid={stats['not_paid']}")
+                    
+        return fee_type_stats
+    except Exception as e:
+        app.logger.error(f"Error getting payment status by fee type: {str(e)}")
+        import traceback
+        app.logger.error(traceback.format_exc())
+        return fee_type_stats  # Return empty stats on error
+
+@app.route('/')
+def index():
+    # Redirect to dashboard if logged in, otherwise to admin login page
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('admin_login'))
+
 def create_visualizations(filters=None):
     # Configure matplotlib to use a non-interactive backend
     import matplotlib
@@ -75,178 +173,24 @@ def create_visualizations(filters=None):
     charts = {}
     
     try:
-        # Get real data from database instead of sample data
-        payments_query = db.session.query(
-            Student.batch_year,
-            Payment.fee_type.label('phase'),
-            db.func.sum(Payment.amount_paid).label('paid_amount'),
-            Payment.date.label('payment_date')
-        ).join(
-            Student, 
-            Payment.regd_no == Student.regd_no
-        )
-        
-        # Apply filters if provided
-        if filters:
-            if filters.get('batch_year'):
-                payments_query = payments_query.filter(Student.batch_year == filters['batch_year'])
-            if filters.get('fee_type'):
-                # Use case-insensitive LIKE with wildcards for more flexible matching
-                fee_type = filters['fee_type'].lower()
-                payments_query = payments_query.filter(db.func.lower(Payment.fee_type).like(f'%{fee_type}%'))
-        
-        # Execute query and convert to DataFrame with explicit error handling
+        # Chart 2: Fee type-wise Payment Status by Batch Year - IMPROVED IMPLEMENTATION
+        # Create a SINGLE graph combining paid and unpaid students by fee type and batch year
+        plt.figure(figsize=(14, 10))  # Larger figure for better visibility
+
         try:
-            payments_data = payments_query.all()
+            fee_status_data = get_payment_status_by_fee_type()
             
-            # Create DataFrame with safer handling of payment dates
-            df_data = []
-            for p in payments_data:
-                try:
-                    # Create a dictionary for each row with proper date handling
-                    row_dict = {
-                        'batch_year': p.batch_year,
-                        'phase': p.phase,
-                        'paid_amount': float(p.paid_amount),
-                        'payment_date': None  # Default to None
-                    }
-                    
-                    # Only set payment_date if it's valid
-                    if p.payment_date is not None:
-                        row_dict['payment_date'] = p.payment_date
-                        
-                    df_data.append(row_dict)
-                except Exception as row_error:
-                    app.logger.warning(f"Error processing payment row: {str(row_error)}")
-                    continue
-                    
-            df = pd.DataFrame(df_data)
-            
-            # Log DataFrame information for debugging
-            app.logger.info(f"DataFrame created with shape: {df.shape}")
-            app.logger.info(f"DataFrame columns: {df.columns.tolist()}")
-            app.logger.info(f"Payment date column info: {df['payment_date'].describe()}")
-            app.logger.info(f"Null payment dates: {df['payment_date'].isna().sum()}")
-            
-        except Exception as df_error:
-            app.logger.error(f"Error creating DataFrame: {str(df_error)}")
+            # ...existing code...
+        
+        except Exception as e:
+            app.logger.error(f"Error generating payment status chart: {str(e)}")
             import traceback
             app.logger.error(traceback.format_exc())
-            return {"error": f"Error creating DataFrame: {str(df_error)}"}
+            plt.text(0.5, 0.5, f'Error: {str(e)}', 
+                    ha='center', va='center', fontsize=14, transform=plt.gca().transAxes)
+            plt.gca().set_axis_off()
         
-        # If no data, return empty charts
-        if df.empty:
-            return {"no_data": True}
-            
-        # FIXED: Chart 1: Bar Chart (Total Fee Collected per Batch Year BY FEE TYPE)
-        plt.figure(figsize=(14, 8))  # Increased size for better visibility
-        
-        # Get all batch years from the student table first
-        all_batch_years_query = db.session.query(Student.batch_year).distinct().order_by(Student.batch_year)
-        all_batch_years = [year[0] for year in all_batch_years_query.all()]
-        
-        # Improved query for payment totals by batch year and fee type
-        # Use an explicit LEFT JOIN to ensure all batch years are included
-        fee_totals_query = db.session.query(
-            Student.batch_year,
-            Payment.fee_type,
-            db.func.sum(Payment.amount_paid).label('total_paid')
-        ).join(
-            Payment,
-            Payment.regd_no == Student.regd_no
-        ).group_by(
-            Student.batch_year,
-            Payment.fee_type
-        ).all()
-        
-        app.logger.info(f"Fee totals query returned {len(fee_totals_query)} records")
-        
-        # Create a DataFrame with all batch years and standard fee types
-        standard_fee_types = ['CRT', 'Phase 2', 'Phase 3']
-        all_combinations = []
-        
-        for batch_year in all_batch_years:
-            for fee_type in standard_fee_types:
-                all_combinations.append({
-                    'batch_year': batch_year,
-                    'fee_type': fee_type,
-                    'total_paid': 0.0  # Default to zero
-                })
-        
-        base_df = pd.DataFrame(all_combinations)
-        
-        # Process query results and update the DataFrame
-        for batch_year, fee_type, total_paid in fee_totals_query:
-            # Get the standardized fee type label
-            std_fee_type = get_standardized_fee_type_label(fee_type)
-            
-            # Only update if it's one of our standard fee types
-            if std_fee_type in standard_fee_types:
-                # Find the matching row in our DataFrame
-                mask = (base_df['batch_year'] == batch_year) & (base_df['fee_type'] == std_fee_type)
-                
-                # Add the payment amount to the existing value (to handle multiple records with same std fee type)
-                if any(mask):
-                    base_df.loc[mask, 'total_paid'] += float(total_paid)
-        
-        # Create pivot table for plotting
-        pivot_df = base_df.pivot(index='batch_year', columns='fee_type', values='total_paid')
-        
-        # Reset index to get batch_year as column and ensure proper ordering
-        pivot_df = pivot_df.reindex(all_batch_years).reset_index()
-        
-        # Log the pivot table data for debugging
-        app.logger.info(f"Pivot DataFrame columns: {pivot_df.columns.tolist()}")
-        app.logger.info(f"Pivot DataFrame shape: {pivot_df.shape}")
-        app.logger.info(f"Pivot DataFrame head: {pivot_df.head().to_dict()}")
-        
-        # Set up the figure with adjusted size
-        fig, ax = plt.subplots(figsize=(14, 8))
-        
-        # Define bar properties
-        bar_width = 0.25
-        index = np.arange(len(pivot_df))
-        
-        # Make sure all required columns exist
-        for fee_type in standard_fee_types:
-            if fee_type not in pivot_df.columns:
-                pivot_df[fee_type] = 0
-        
-        # Create grouped bars for each fee type with custom colors and error handling
-        crt_bars = ax.bar(index - bar_width, pivot_df['CRT'], bar_width, label='CRT', color='#4CAF50')
-        phase2_bars = ax.bar(index, pivot_df['Phase 2'], bar_width, label='Phase 2', color='#2196F3')
-        phase3_bars = ax.bar(index + bar_width, pivot_df['Phase 3'], bar_width, label='Phase 3', color='#FFC107')
-        
-        # Add data labels to each bar
-        def add_labels(bars):
-            for bar in bars:
-                height = bar.get_height()
-                if height > 0:  # Only add labels to bars with values
-                    ax.text(bar.get_x() + bar.get_width()/2., height + 500,
-                            f'₹{int(height):,}', ha='center', va='bottom', 
-                            rotation=0, fontsize=9)
-        
-        add_labels(crt_bars)
-        add_labels(phase2_bars)
-        add_labels(phase3_bars)
-        
-        # Set up axes, labels, and title
-        ax.set_title('Fee Collection by Batch Year and Fee Type', fontsize=14, fontweight='bold')
-        ax.set_xlabel('Batch Year', fontsize=12)
-        ax.set_ylabel('Amount Collected (₹)', fontsize=12)
-        ax.set_xticks(index)
-        ax.set_xticklabels(pivot_df['batch_year'], rotation=45)
-        ax.legend()
-        ax.grid(axis='y', linestyle='--', alpha=0.7)
-        
-        plt.tight_layout()
-        
-        buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
-        buf.seek(0)
-        charts['total_fee'] = base64.b64encode(buf.read()).decode('utf-8')
-        plt.close('all')
-        
+        # ...existing code...
         # Chart 2: Fee type-wise Payment Status by Batch Year - IMPROVED IMPLEMENTATION
         # Create a SINGLE graph combining paid and unpaid students by fee type and batch year
         plt.figure(figsize=(14, 10))  # Larger figure for better visibility
@@ -514,155 +458,122 @@ def create_visualizations(filters=None):
         plt.savefig(buf, format='png', dpi=100)
         buf.seek(0)
         charts['payments_over_time'] = base64.b64encode(buf.read()).decode('utf-8')
-        plt.close('all')  # Close all figures
+        plt.close('all')  # Close all figurez
         
+        plt.figure(figsize=(14, 8))  # Increased size for better visibility
+        
+        # Get all batch years from the student table first
+        all_batch_years_query = db.session.query(Student.batch_year).distinct().order_by(Student.batch_year)
+        all_batch_years = [year[0] for year in all_batch_years_query.all()]
+        
+        # Improved query for payment totals by batch year and fee type
+        # Use an explicit LEFT JOIN to ensure all batch years are included
+        fee_totals_query = db.session.query(
+            Student.batch_year,
+            Payment.fee_type,
+            db.func.sum(Payment.amount_paid).label('total_paid')
+        ).join(
+            Payment,
+            Payment.regd_no == Student.regd_no
+        ).group_by(
+            Student.batch_year,
+            Payment.fee_type
+        ).all()
+        
+        app.logger.info(f"Fee totals query returned {len(fee_totals_query)} records")
+        
+        # Create a DataFrame with all batch years and standard fee types
+        standard_fee_types = ['CRT', 'Phase 2', 'Phase 3']
+        all_combinations = []
+        
+        for batch_year in all_batch_years:
+            for fee_type in standard_fee_types:
+                all_combinations.append({
+                    'batch_year': batch_year,
+                    'fee_type': fee_type,
+                    'total_paid': 0.0  # Default to zero
+                })
+        
+        base_df = pd.DataFrame(all_combinations)
+        
+        # Process query results and update the DataFrame
+        for batch_year, fee_type, total_paid in fee_totals_query:
+            # Get the standardized fee type label
+            std_fee_type = get_standardized_fee_type_label(fee_type)
+            
+            # Only update if it's one of our standard fee types
+            if std_fee_type in standard_fee_types:
+                # Find the matching row in our DataFrame
+                mask = (base_df['batch_year'] == batch_year) & (base_df['fee_type'] == std_fee_type)
+                
+                # Add the payment amount to the existing value (to handle multiple records with same std fee type)
+                if any(mask):
+                    base_df.loc[mask, 'total_paid'] += float(total_paid)
+        
+        # Create pivot table for plotting
+        pivot_df = base_df.pivot(index='batch_year', columns='fee_type', values='total_paid')
+        
+        # Reset index to get batch_year as column and ensure proper ordering
+        pivot_df = pivot_df.reindex(all_batch_years).reset_index()
+        
+        # Log the pivot table data for debugging
+        app.logger.info(f"Pivot DataFrame columns: {pivot_df.columns.tolist()}")
+        app.logger.info(f"Pivot DataFrame shape: {pivot_df.shape}")
+        app.logger.info(f"Pivot DataFrame head: {pivot_df.head().to_dict()}")
+        
+        # Set up the figure with adjusted size
+        fig, ax = plt.subplots(figsize=(14, 8))
+        
+        # Define bar properties
+        bar_width = 0.25
+        index = np.arange(len(pivot_df))
+        
+        # Make sure all required columns exist
+        for fee_type in standard_fee_types:
+            if fee_type not in pivot_df.columns:
+                pivot_df[fee_type] = 0
+        
+        # Create grouped bars for each fee type with custom colors and error handling
+        crt_bars = ax.bar(index - bar_width, pivot_df['CRT'], bar_width, label='CRT', color='#4CAF50')
+        phase2_bars = ax.bar(index, pivot_df['Phase 2'], bar_width, label='Phase 2', color='#2196F3')
+        phase3_bars = ax.bar(index + bar_width, pivot_df['Phase 3'], bar_width, label='Phase 3', color='#FFC107')
+        
+        # Add data labels to each bar
+        def add_labels(bars):
+            for bar in bars:
+                height = bar.get_height()
+                if height > 0:  # Only add labels to bars with values
+                    ax.text(bar.get_x() + bar.get_width()/2., height + 500,
+                            f'₹{int(height):,}', ha='center', va='bottom', 
+                            rotation=0, fontsize=9)
+        
+        add_labels(crt_bars)
+        add_labels(phase2_bars)
+        add_labels(phase3_bars)
+        
+        # Set up axes, labels, and title
+        ax.set_title('Fee Collection by Batch Year and Fee Type', fontsize=14, fontweight='bold')
+        ax.set_xlabel('Batch Year', fontsize=12)
+        ax.set_ylabel('Amount Collected (₹)', fontsize=12)
+        ax.set_xticks(index)
+        ax.set_xticklabels(pivot_df['batch_year'], rotation=45)
+        ax.legend()
+        ax.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        plt.tight_layout()
+        
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=100)
+        buf.seek(0)
+        charts['total_fee'] = base64.b64encode(buf.read()).decode('utf-8')
+        plt.close('all') 
+
     except Exception as e:
         app.logger.error(f"Error creating visualizations: {str(e)}")
         import traceback
         app.logger.error(traceback.format_exc())
-        charts["error"] = str(e)
-    return charts
-
-def get_payment_status_counts(fee_type):
-    """Get counts of each payment status for a specific fee type"""
-    try:
-        # Normalize fee type for consistent comparison
-        normalized_type = normalize_fee_type(fee_type)
-        
-        # Get all fee master entries for this fee type
-        fee_entries = db.session.query(
-            FeeMaster.regd_no, 
-            FeeMaster.amount
-        ).filter(
-            db.func.lower(FeeMaster.fee_type).like(f'%{normalized_type}%')
-        ).all()
-        
-        # Get all payments for this fee type
-        payment_data = db.session.query(
-            Payment.regd_no,
-            db.func.sum(Payment.amount_paid).label('total_paid')
-        ).filter(
-            db.func.lower(Payment.fee_type).like(f'%{normalized_type}%')
-        ).group_by(
-            Payment.regd_no
-        ).all()
-        
-        # Create mapping of reg_no to payment amount
-        payments = {p.regd_no: p.total_paid for p in payment_data}
-        
-        # Count payment statuses
-        paid_count = 0
-        partially_paid_count = 0
-        not_paid_count = 0
-        
-        for reg_no, fee_amount in fee_entries:
-            paid_amount = payments.get(reg_no, 0)
-            
-            # Compare with small epsilon to avoid floating point issues
-            if paid_amount >= (fee_amount - 0.01):
-                paid_count += 1
-            elif paid_amount > 0:
-                partially_paid_count += 1
-            else:
-                not_paid_count += 1
-        
-        return {
-            'paid': paid_count,
-            'partially_paid': partially_paid_count,
-            'not_paid': not_paid_count
-        }
-    except Exception as e:
-        app.logger.error(f"Error getting payment status counts for {fee_type}: {str(e)}")        
-        return {'paid': 0, 'partially_paid': 0, 'not_paid': 0}
-
-def get_payment_status_by_fee_type():
-    fee_type_stats = {}
-    
-    try:
-        # Get all distinct batch years
-        batch_years = [year[0] for year in db.session.query(Student.batch_year).distinct().order_by(Student.batch_year).all()]
-        
-        # Initialize the stats dictionary with batch year breakdowns
-        for fee_type in ['CRT', 'Phase 2', 'Phase 3']:
-            fee_type_stats[fee_type] = {
-                'total': 0, 
-                'paid': 0, 
-                'partially_paid': 0, 
-                'not_paid': 0,
-                'by_batch': {year: {'total': 0, 'paid': 0, 'partially_paid': 0, 'not_paid': 0} for year in batch_years}
-            }
-        
-        # Get all students with fee entries
-        students = db.session.query(Student.regd_no, Student.batch_year).join(
-            FeeMaster, FeeMaster.regd_no == Student.regd_no
-        ).distinct().all()
-        
-        # Process each student
-        for student in students:
-            regd_no = student.regd_no
-            batch_year = student.batch_year
-            
-            # Get all fee entries for this student
-            fee_entries = db.session.query(
-                FeeMaster.fee_type,
-                FeeMaster.amount,
-                FeeMaster.remarks
-            ).filter(FeeMaster.regd_no == regd_no).all()
-            
-            # Process each fee entry
-            for entry in fee_entries:
-                std_fee_type = get_standardized_fee_type_label(entry.fee_type)
-                
-                # Skip if not one of our standard fee types
-                if std_fee_type not in fee_type_stats:
-                    continue
-                
-                # Get payment info for this fee type
-                normalized_entry_type = normalize_fee_type(entry.fee_type)
-                payment = db.session.query(
-                    db.func.sum(Payment.amount_paid).label('total_paid')
-                ).filter(
-                    Payment.regd_no == regd_no,
-                    db.func.lower(Payment.fee_type).like(f'%{normalized_entry_type}%')
-                ).first()
-                
-                # Calculate payment status using same logic as student details
-                total_paid = payment.total_paid if payment and payment.total_paid else 0
-                entry_amount = float(entry.amount)
-                
-                # Increment total counter
-                fee_type_stats[std_fee_type]['total'] += 1
-                if batch_year in fee_type_stats[std_fee_type]['by_batch']:
-                    fee_type_stats[std_fee_type]['by_batch'][batch_year]['total'] += 1
-                
-                # Determine status with same epsilon logic as student details
-                epsilon = 0.01  # Allow for small floating point differences
-                if total_paid >= (entry_amount - epsilon):
-                    fee_type_stats[std_fee_type]['paid'] += 1
-                    if batch_year in fee_type_stats[std_fee_type]['by_batch']:
-                        fee_type_stats[std_fee_type]['by_batch'][batch_year]['paid'] += 1
-                elif total_paid > 0:
-                    fee_type_stats[std_fee_type]['partially_paid'] += 1
-                    if batch_year in fee_type_stats[std_fee_type]['by_batch']:
-                        fee_type_stats[std_fee_type]['by_batch'][batch_year]['partially_paid'] += 1
-                else:
-                    fee_type_stats[std_fee_type]['not_paid'] += 1
-                    if batch_year in fee_type_stats[std_fee_type]['by_batch']:
-                        fee_type_stats[std_fee_type]['by_batch'][batch_year]['not_paid'] += 1
-                    
-        return fee_type_stats
-    except Exception as e:
-        app.logger.error(f"Error getting payment status by fee type: {str(e)}")
-        import traceback
-        app.logger.error(traceback.format_exc())
-        return fee_type_stats  # Return empty stats on error
-
-@app.route('/')
-def index():
-    # Redirect to dashboard if logged in, otherwise to admin login page
-    if current_user.is_authenticated:
-        return redirect(url_for('dashboard'))
-    return redirect(url_for('admin_login'))
+        charts["error"] = str(e) 
+    return charts 
 
 @app.route('/dashboard', methods=['GET', 'POST'])
 def dashboard():
@@ -687,7 +598,8 @@ def dashboard():
         # Get payment status counts for summary
         payment_status_counts = {
             'fully_paid': crt_data.get('fully_paid', 0) + phase2_data.get('fully_paid', 0) + phase3_data.get('fully_paid', 0),
-            'total_students': crt_data.get('total_students', 0) + phase2_data.get('total_students', 0) + phase3_data.get('total_students', 0)
+            'total_students': crt_data.get('total_students', 0) + phase2_data.get('total_students', 0) + phase3_data.get('total_students', 0),
+            'not_paid': crt_data.get('not_paid', 0) + phase2_data.get('not_paid', 0) + phase3_data.get('not_paid', 0)
         }
         
         app.logger.info(f"CRT data: {crt_data}")
@@ -716,7 +628,7 @@ def dashboard():
                             batch_years=batch_years,
                             )
     except Exception as e:
-        app.logger.error(f"Dashboard error: {str(e)}")
+        app.logger.error(f"Error loading dashboard: {str(e)}")
         import traceback
         app.logger.error(traceback.format_exc())
         flash(f"Error loading dashboard: {str(e)}", "error")
@@ -810,7 +722,6 @@ def get_total_summary():
         return {'total': 0, 'count': 0}
 
 @app.route('/upload', methods=['GET', 'POST'])
-@login_required
 def upload():
     if request.method == 'POST':
         # Debugging - log request information
@@ -1042,7 +953,6 @@ def upload():
     return render_template('upload.html')
 
 @app.route('/payments', methods=['GET', 'POST'])
-@login_required
 def payments():
     # Initialize empty payment history in case of errors
     payment_history = []
@@ -1302,7 +1212,7 @@ def payments():
                           batch_year=batch_year)
 
 @app.route('/download_template')
-@login_required
+
 def download_template():
     """Generate and provide a sample template for download in Excel or CSV format"""
     format_type = request.args.get('format', 'excel')  # Default to Excel if not specified
@@ -1316,7 +1226,7 @@ def download_template():
             'branch': ['CSE', 'IT', 'CSE-AI&DS'],
             'mobile': ['9876543210', '8765432109', '7654321098'],
             'fee_type': ['CRT', 'Phase 2', 'Phase 3'],
-            'amount': [15000, 5000, 7500],
+            'amount': [10000, 15000, 20000],
         }
         
         df = pd.DataFrame(sample_data)
@@ -1729,7 +1639,6 @@ def unpaid_students():
                     payment = db.session.query(
                         db.func.sum(Payment.amount_paid).label('total_paid')
                     ).filter(
-                        Payment.regd_no == student.regd_no,
                         db.func.lower(Payment.fee_type).like(f'%{normalized_type}%')
                     ).first()
                     
@@ -2267,6 +2176,113 @@ def get_registrations_by_batch():
         app.logger.error(f"Error fetching registration numbers: {str(e)}")
         return jsonify([])
 
+@app.route('/delete_paid_students', methods=['GET', 'POST'])
+@login_required
+def delete_paid_students():
+    if request.method == 'POST':
+        try:
+            # Get the batch_year filter if provided
+            batch_year = request.form.get('batch_year', '')
+            fee_type = request.form.get('fee_type', '')
+            confirm = request.form.get('confirm', '') == 'yes'
+            
+            if not confirm:
+                flash('Please confirm deletion by checking the confirmation box.', 'warning')
+                return redirect(url_for('delete_paid_students'))
+            
+            # Step 1: Find all fee master entries for fully paid students
+            fee_entries_query = FeeMaster.query
+            
+            # Apply batch year filter if provided
+            if batch_year:
+                fee_entries_query = fee_entries_query.join(
+                    Student, 
+                    FeeMaster.regd_no == Student.regd_no
+                ).filter(Student.batch_year == batch_year)
+            
+            # Apply fee type filter if provided
+            if fee_type:
+                normalized_fee_type = normalize_fee_type(fee_type)
+                fee_entries_query = fee_entries_query.filter(
+                    db.func.lower(FeeMaster.fee_type).like(f'%{normalized_fee_type}%')
+                )
+            
+            # Get all fee entries
+            fee_entries = fee_entries_query.all()
+            
+            # Track which entries are fully paid
+            fully_paid_entries = []
+            
+            for entry in fee_entries:
+                fee_amount = float(entry.amount)
+                
+                # Get payment info for this entry
+                payment = db.session.query(
+                    db.func.sum(Payment.amount_paid).label('total_paid')
+                ).filter(
+                    Payment.regd_no == entry.regd_no,
+                    db.func.lower(Payment.fee_type).like(f'%{normalize_fee_type(entry.fee_type)}%')
+                ).first()
+                
+                # Calculate total paid amount
+                paid_amount = float(payment.total_paid) if payment and payment.total_paid else 0
+                
+                # Check if fully paid (with small epsilon to handle floating point comparison)
+                if paid_amount >= (fee_amount - 0.01):
+                    fully_paid_entries.append(entry)
+            
+            if not fully_paid_entries:
+                flash('No fully paid student records found matching the criteria.', 'info')
+                return redirect(url_for('delete_paid_students'))
+            
+            # Count students to be deleted (unique registration numbers)
+            unique_reg_nos = set(entry.regd_no for entry in fully_paid_entries)
+            
+            # Begin deletion process within a transaction
+            deleted_entries = 0
+            deleted_payments = 0
+            try:
+                # Step 2: Delete related payment records
+                for entry in fully_paid_entries:
+                    # Delete payment records for this student and fee type
+                    payment_result = db.session.query(Payment).filter(
+                        Payment.regd_no == entry.regd_no,
+                        db.func.lower(Payment.fee_type).like(f'%{normalize_fee_type(entry.fee_type)}%')
+                    ).delete(synchronize_session=False)
+                    
+                    deleted_payments += payment_result
+                
+                # Step 3: Delete fee master entries
+                for entry in fully_paid_entries:
+                    db.session.delete(entry)
+                    deleted_entries += 1
+                
+                # Commit changes
+                db.session.commit()
+                
+                # Success message with deletion counts
+                flash(f'Successfully deleted {deleted_entries} fee records and {deleted_payments} payment records '
+                      f'for {len(unique_reg_nos)} fully paid students.', 'success')
+                
+                return redirect(url_for('dashboard'))
+                
+            except Exception as e:
+                db.session.rollback()
+                app.logger.error(f"Error deleting paid student data: {str(e)}")
+                flash(f'Error deleting records: {str(e)}', 'error')
+        
+        except Exception as e:
+            app.logger.error(f"Error in delete_paid_students: {str(e)}")
+            import traceback
+            app.logger.error(traceback.format_exc())
+            flash(f'An error occurred: {str(e)}', 'error')
+    
+    # Get batch years for the filter dropdown
+    batch_years = [year[0] for year in db.session.query(Student.batch_year).distinct().order_by(Student.batch_year).all()]
+    fee_types = ['CRT', 'Phase 2', 'Phase 3']
+    
+    return render_template('delete_paid_students.html', batch_years=batch_years, fee_types=fee_types)
+
+
 if __name__ == '__main__':
     app.run(debug=True)
-
