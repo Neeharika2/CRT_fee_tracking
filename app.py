@@ -1316,6 +1316,7 @@ def download_template():
             'branch': ['CSE', 'IT', 'CSE-AI&DS'],
             'mobile': ['9876543210', '8765432109', '7654321098'],
             'fee_type': ['CRT', 'Phase 2', 'Phase 3'],
+            'amount': [15000, 5000, 7500],
         }
         
         df = pd.DataFrame(sample_data)
