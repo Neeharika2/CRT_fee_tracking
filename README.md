@@ -71,6 +71,8 @@ The Fee Management System is a web application designed to manage student fee pa
 
 1. Navigate to the admin login page: `http://127.0.0.1:5000/admin/login`
 2. Enter the admin credentials to log in.
+3. username: admin
+   password: adminpass
 
 ### Uploading Fee Data
 
